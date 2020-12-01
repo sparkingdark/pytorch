@@ -487,6 +487,41 @@ class Graph:
                     type_repr(sub_type)
             return typename
 
+
+        # Run through reverse nodes and record the first instance of a use
+        # of a given node. This represents the *last* use of the node in the
+        # execution order of the program, which we will use to free unused
+        # values
+        node_to_last_use : Dict[Node, Node] = {}
+
+        def register_last_uses(n : Node, user : Node):
+            if n not in node_to_last_use:
+                node_to_last_use[n] = user
+
+        for node in reversed(self.nodes):
+            map_arg(node.args, lambda n: register_last_uses(n, node))
+            map_arg(node.kwargs, lambda n: register_last_uses(n, node))
+
+        def delete_unused_values(user : Node):
+            """
+            Delete values after their last use. This ensures that values that are
+            not used in the remainder of the code are freed and the memory usage
+            of the code is optimal.
+            """
+            nodes_to_delete : Set[Node] = set()
+
+            def find_nodes_to_delete(n : Node):
+                last_use : Optional[Node] = node_to_last_use.get(n)
+                if last_use and last_use == user:
+                    nodes_to_delete.add(n)
+
+            map_arg(node.args, find_nodes_to_delete)
+            map_arg(node.kwargs, find_nodes_to_delete)
+
+            if len(nodes_to_delete):
+                to_delete_str = ' = '.join([n.name for n in nodes_to_delete] + ['None'])
+                body.append(f'{to_delete_str}\n')
+
         for node in self.nodes:
             if node.op == 'placeholder':
                 assert isinstance(node.target, str)
@@ -502,6 +537,7 @@ class Graph:
                 body.append(
                     f'{node.name} = {_format_target(repr(node.args[0]), node.target)}'
                     f'({_format_args(node.args[1:], node.kwargs)})\n')
+                delete_unused_values(node)
                 continue
             elif node.op == 'call_function':
                 assert callable(node.target)
@@ -509,6 +545,7 @@ class Graph:
                 if node.target.__module__ == '_operator' and node.target.__name__ in magic_methods:
                     assert isinstance(node.args, tuple)
                     body.append(f'{node.name} = {magic_methods[node.target.__name__].format(*(repr(a) for a in node.args))}\n')
+                    delete_unused_values(node)
                     continue
                 qualified_name = get_qualified_name(node.target)
                 register_modules_used(qualified_name)
@@ -518,16 +555,20 @@ class Graph:
                    node.args[1].isidentifier():
                     # pretty print attribute access
                     body.append(f'{node.name} = {_format_target(repr(node.args[0]), node.args[1])}\n')
+                    delete_unused_values(node)
                     continue
                 body.append(f'{node.name} = {qualified_name}({_format_args(node.args, node.kwargs)})\n')
+                delete_unused_values(node)
                 continue
             elif node.op == 'call_module':
                 assert isinstance(node.target, str)
                 body.append(f'{node.name} = {_format_target(root_module, node.target)}({_format_args(node.args, node.kwargs)})\n')
+                delete_unused_values(node)
                 continue
             elif node.op == 'get_attr':
                 assert isinstance(node.target, str)
                 body.append(f'{node.name} = {_format_target(root_module, node.target)}\n')
+                delete_unused_values(node)
                 continue
             elif node.op == 'output':
                 if node.type is not None:
