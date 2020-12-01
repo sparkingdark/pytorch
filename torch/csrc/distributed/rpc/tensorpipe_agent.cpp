@@ -31,9 +31,14 @@ const std::string kServerActiveAsyncCalls = "agent.server_active_async_calls";
 
 } // namespace
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 C10_DEFINE_REGISTRY(TensorPipeTransportRegistry, TransportRegistration);
 
-C10_DEFINE_REGISTRY(TensorPipeChannelRegistry, ChannelRegistration);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+C10_DEFINE_REGISTRY(TensorPipeCpuChannelRegistry, CpuChannelRegistration);
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+C10_DEFINE_REGISTRY(TensorPipeCudaChannelRegistry, CudaChannelRegistration);
 
 std::string TensorPipeAgent::guessUvAddress(
     tensorpipe::transport::uv::Context& uvContext) {
@@ -83,6 +88,7 @@ std::unique_ptr<TransportRegistration> makeUvTransport() {
 
 // The UV transport is implemented using standard TCP connections. It leverages
 // libuv (https://github.com/libuv/libuv) in order to be cross-platform.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 C10_REGISTER_CREATOR(TensorPipeTransportRegistry, uv, makeUvTransport);
 
 #if TENSORPIPE_HAS_SHM_TRANSPORT
@@ -109,26 +115,28 @@ std::unique_ptr<TransportRegistration> makeShmTransport() {
 // memory (plus UNIX domain sockets to bootstrap the connection and exchange
 // file descriptors). It is Linux-only due to some advanced features (O_TMPFILE,
 // eventfd, ...).
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 C10_REGISTER_CREATOR(TensorPipeTransportRegistry, shm, makeShmTransport);
 
 #endif
 
-std::unique_ptr<ChannelRegistration> makeBasicChannel() {
+std::unique_ptr<CpuChannelRegistration> makeBasicChannel() {
   auto context = std::make_shared<tensorpipe::channel::basic::Context>();
-  return std::make_unique<ChannelRegistration>(
-      ChannelRegistration{std::move(context), kBasicChannelPriority});
+  return std::make_unique<CpuChannelRegistration>(
+      CpuChannelRegistration{std::move(context), kBasicChannelPriority});
 }
 
 // The basic channel is just a straightforward adapter wrapper that allows any
 // transport to be used as a channel.
-C10_REGISTER_CREATOR(TensorPipeChannelRegistry, basic, makeBasicChannel);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+C10_REGISTER_CREATOR(TensorPipeCpuChannelRegistry, basic, makeBasicChannel);
 
 #if TENSORPIPE_HAS_CMA_CHANNEL
 
-std::unique_ptr<ChannelRegistration> makeCmaChannel() {
+std::unique_ptr<CpuChannelRegistration> makeCmaChannel() {
   auto context = std::make_shared<tensorpipe::channel::cma::Context>();
-  return std::make_unique<ChannelRegistration>(
-      ChannelRegistration{std::move(context), kCmaChannelPriority});
+  return std::make_unique<CpuChannelRegistration>(
+      CpuChannelRegistration{std::move(context), kCmaChannelPriority});
 }
 
 // The CMA channel uses the Linux cross-memory attach syscalls (process_vm_readv
@@ -136,13 +144,14 @@ std::unique_ptr<ChannelRegistration> makeCmaChannel() {
 // process (as long as they belong to the same user and other security
 // constraints are satisfied). It does, more or less, what GDB does when it's
 // attached to a running process.
-C10_REGISTER_CREATOR(TensorPipeChannelRegistry, cma, makeCmaChannel);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+C10_REGISTER_CREATOR(TensorPipeCpuChannelRegistry, cma, makeCmaChannel);
 
 #endif
 
 constexpr static int kNumUvThreads = 16;
 
-std::unique_ptr<ChannelRegistration> makeMultiplexedUvChannel() {
+std::unique_ptr<CpuChannelRegistration> makeMultiplexedUvChannel() {
   std::vector<std::shared_ptr<tensorpipe::transport::Context>> contexts;
   std::vector<std::shared_ptr<tensorpipe::transport::Listener>> listeners;
   for (int laneIdx = 0; laneIdx < kNumUvThreads; ++laneIdx) {
@@ -153,8 +162,8 @@ std::unique_ptr<ChannelRegistration> makeMultiplexedUvChannel() {
   }
   auto context = std::make_shared<tensorpipe::channel::mpt::Context>(
       std::move(contexts), std::move(listeners));
-  return std::make_unique<ChannelRegistration>(
-      ChannelRegistration{std::move(context), kMultiplexedUvChannelPriority});
+  return std::make_unique<CpuChannelRegistration>(
+      CpuChannelRegistration{std::move(context), kMultiplexedUvChannelPriority});
 }
 
 // The multiplexed UV channel encapsulates multiple UV transports (each with its
@@ -163,10 +172,27 @@ std::unique_ptr<ChannelRegistration> makeMultiplexedUvChannel() {
 // is split in equal chunks and each chunks is sent on a different connection
 // and thus driven by a different thread. This is needed to reach very high
 // bandwidths.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 C10_REGISTER_CREATOR(
-    TensorPipeChannelRegistry,
+    TensorPipeCpuChannelRegistry,
     mpt_uv,
     makeMultiplexedUvChannel);
+
+#if TENSORPIPE_HAS_CUDA_IPC_CHANNEL && defined(USE_CUDA_NOT_ROCM)
+
+constexpr int64_t kCudaIpcChannelPriority = 300;
+
+std::unique_ptr<CudaChannelRegistration> makeCudaIpcChannel() {
+  auto context = std::make_shared<tensorpipe::channel::cuda_ipc::Context>();
+  return std::make_unique<CudaChannelRegistration>(
+      CudaChannelRegistration{std::move(context), kCudaIpcChannelPriority});
+}
+
+// The cuda_ipc channels use cudaMemcpy to transmit CUDA tensor across processes
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+C10_REGISTER_CREATOR(TensorPipeCudaChannelRegistry, cuda_ipc, makeCudaIpcChannel);
+
+#endif
 
 } // namespace
 
@@ -285,26 +311,54 @@ void TensorPipeAgent::startImpl() {
         priority, std::move(key), std::move(reg->transport));
   }
 
-  for (auto& key : TensorPipeChannelRegistry()->Keys()) {
-    int64_t priority = -1;
-    if (opts_.channels.has_value()) {
-      auto iter =
-          std::find(opts_.channels->begin(), opts_.channels->end(), key);
-      if (iter == opts_.channels->end()) {
-        continue;
+  auto registerChannel = [this](
+      std::vector<std::string>&& keys,
+      const std::function<void(int64_t, std::string&&)>& cb) {
+    for (auto& key : keys) {
+      int64_t priority = -1;
+      if (opts_.channels.has_value()) {
+        auto iter =
+            std::find(opts_.channels->begin(), opts_.channels->end(), key);
+        if (iter == opts_.channels->end()) {
+          continue;
+        }
+        // Assign priorities in reverse order of occurrence in the vector, so that
+        // a channel that comes before another receives a higher priority.
+        priority = opts_.channels->size() - 1 - (iter - opts_.channels->begin());
       }
-      // Assign priorities in reverse order of occurrence in the vector, so that
-      // a channel that comes before another receives a higher priority.
-      priority = opts_.channels->size() - 1 - (iter - opts_.channels->begin());
+      cb(priority, std::move(key));
     }
-    std::unique_ptr<ChannelRegistration> reg =
-        TensorPipeChannelRegistry()->Create(key);
-    if (priority == -1) {
-      priority = reg->priority;
-    }
-    context_->registerChannel(
-        priority, std::move(key), std::move(reg->channel));
-  }
+  };
+
+  registerChannel(
+      TensorPipeCpuChannelRegistry()->Keys(),
+      [this](int64_t priority, std::string&& key) {
+        std::unique_ptr<CpuChannelRegistration> reg =
+            TensorPipeCpuChannelRegistry()->Create(key);
+        if (priority == -1) {
+          priority = reg->priority;
+        }
+        context_->registerChannel(
+            priority, std::move(key), std::move(reg->channel));
+      }
+  );
+
+#ifdef USE_CUDA_NOT_ROCM
+
+  registerChannel(
+      TensorPipeCudaChannelRegistry()->Keys(),
+      [this](int64_t priority, std::string&& key) {
+        std::unique_ptr<CudaChannelRegistration> reg =
+            TensorPipeCudaChannelRegistry()->Create(key);
+        if (priority == -1) {
+          priority = reg->priority;
+        }
+        context_->registerChannel(
+            priority, std::move(key), std::move(reg->channel));
+      }
+  );
+
+#endif
 
   listener_ = context_->listen(addresses);
 
